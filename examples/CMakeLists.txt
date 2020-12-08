@@ -4,6 +4,9 @@ target_link_libraries(map-addr vmi_shared)
 add_executable(cr3-event-example cr3-event-example.c)
 target_link_libraries(cr3-event-example vmi_shared)
 
+add_executable(cr3-fast-switch-test cr3-fast-switch-test.c)
+target_link_libraries(cr3-fast-switch-test vmi_shared xenctrl)
+
 add_executable(descriptor-event-example descriptor-event-example.c)
 target_link_libraries(descriptor-event-example vmi_shared)
 
