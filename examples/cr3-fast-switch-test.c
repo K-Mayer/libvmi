@@ -36,56 +36,159 @@
 #include <xenctrl.h>
 
 static int systemCr3Events = 0;
-static int unwantedC3Events = 0;
+static int unwantedCr3Events = 0;
 static addr_t targetCr3;
 static int interrupted = 0;
+uint16_t view_x = 0;
+uint16_t view_rw = 0;
+uint64_t vm_id = 0;
 static void close_handler(int sig)
 {
     interrupted = sig;
 }
 
-event_response_t cr3_callback(vmi_instance_t vmi, vmi_event_t *event)
+event_response_t cr3_callback_with_switching(vmi_instance_t vmi, vmi_event_t *event)
 {
     (void)vmi;
     if(event->reg_event.value == targetCr3)
     {
         systemCr3Events++;
+        if( VMI_FAILURE == vmi_slat_switch(vmi, view_x))
+        {
+            printf("Could not switch to view_x.\n");
+        }
     }
     else
     {
-        unwantedC3Events++;
-    }
+        unwantedCr3Events++;
+        if(event->reg_event.previous == targetCr3)
+        {
+            if( VMI_FAILURE == vmi_slat_switch(vmi, 0))
+            {
+                printf("Could not switch to view_rw.\n");
+            }
+        }
+    } 
     
     return VMI_EVENT_RESPONSE_NONE;
 }
 
-status_t set_fast_switch(xc_interface* xc, vmi_instance_t vmi, uint32_t vmi_id, uint targetCr3, uint16_t view_rw, uint16_t view_x)
+event_response_t cr3_callback_only_counting(vmi_instance_t vmi, vmi_event_t *event)
 {
-//     int xc_altp2m_add_fast_switch(xc_interface *handle, uint32_t domid,
-// +		              uint32_t vcpu_id, uint64_t pgd,
-// +			      uint16_t view_rw, uint16_t view_x)
-    for (int i = 0; i < vmi_get_num_vcpus(vmi); i++)
+    (void)vmi;
+    if(event->reg_event.value == targetCr3)
+    {
+        systemCr3Events++;
+
+    }
+    else
+    {
+        unwantedCr3Events++;
+    } 
+    
+    return VMI_EVENT_RESPONSE_NONE;
+}
+
+int setup_fast_switch(xc_interface* xc, vmi_instance_t vmi, uint targetCr3)
+{
+    for (uint i = 0; i < vmi_get_num_vcpus(vmi); i++)
     {
         printf("Setting fast switch for vcpu %d\n", i);
         errno = 0;
-        int rc = xc_altp2m_add_fast_switch(xc, vmi_id, i, targetCr3, view_rw, view_x);
+        int rc = xc_altp2m_add_fast_switch(xc, vm_id, i, targetCr3, view_rw, view_x);
         if(rc < 0)
         {
             printf("add fast switch failed: %d\n", rc);
             int bla = errno;
             printf("xenctrl last error code: %d\n", bla);
             printf("xenctrl error message: %s\n", strerror(bla));
-            return VMI_FAILURE;
+            return 1;
         }
     }
     
-    return VMI_SUCCESS;
+    return 0;
+}
+
+int altp2m_setup(xc_interface* xc, vmi_instance_t vmi) {
+    uint64_t vm_id = vmi_get_vmid(vmi);
+    if (vm_id == VMI_INVALID_DOMID) {
+        printf("Unable to fetch vm id.\n");
+        return 1;
+    }
+    // grab current value of ALTP2M.
+    uint64_t current_altp2m;
+    if (xc_hvm_param_get(xc, vm_id, HVM_PARAM_ALTP2M, &current_altp2m) < 0)
+    {
+        printf("Failed to get HVM_PARAM_ALTP2M.\n");
+        return 1;
+    } else {
+        printf("current_altp2m = %lu\n", current_altp2m);
+    }
+    // is ALTP2M not at external mode? turn it on.
+    if (current_altp2m != XEN_ALTP2M_external &&
+        xc_hvm_param_set(xc, vm_id, HVM_PARAM_ALTP2M, XEN_ALTP2M_external) < 0)
+    {
+        printf("Failed to set HVM_PARAM_ALTP2M.\n");
+        return 1;
+    }
+
+    //create second slat for fast switch
+    if( VMI_FAILURE == vmi_slat_set_domain_state(vmi, true))
+    {
+        printf("Could not enable slat. Aborting");
+        return 1;
+    }
+
+    if( VMI_FAILURE == vmi_slat_create(vmi, &view_rw))
+    {
+        printf("Could not create view_rw. Aborting\n");
+        return 1;
+    }
+    printf("view_rw is %d\n", view_rw);
+
+    if( VMI_FAILURE == vmi_slat_create(vmi, &view_x))
+    {
+        printf("Could not create view_x. Aborting\n");
+        return 1;
+    }
+    printf("view_x is %d\n", view_x);
+
+    return 0;
+}
+
+int measure_cr3_switches(vmi_instance_t vmi, vmi_event_t* cr3_event)
+{
+    int target_seconds = 30;
+    time_t start_time,end_time;
+    status_t status = VMI_FAILURE;
+
+    // register event
+    if (vmi_register_event(vmi, cr3_event) == VMI_FAILURE)
+        return -1;
+
+    for(int i = 0; i<5; i++)
+    {
+        systemCr3Events = 0;
+        unwantedCr3Events = 0;
+        time (&start_time);
+        time (&end_time);
+        printf("Waiting for events in iteration %d. Seconds: %d\n", i, target_seconds);
+        while (!interrupted && (difftime(end_time, start_time) < target_seconds)) 
+        {
+            time (&end_time);
+            status = vmi_events_listen(vmi, 500);
+            if (status == VMI_FAILURE)
+                printf("Failed to listen on events\n");
+        }
+        printf ("Got %d cr3 events for %x in %d sec. %d other events.\n", systemCr3Events, (uint)targetCr3, target_seconds, unwantedCr3Events );
+    }
+    vmi_clear_event(vmi, cr3_event, NULL);
+    return 0;
 }
 
 int main (int argc, char **argv)
 {
     vmi_instance_t vmi = {0};
-    status_t status = VMI_FAILURE;
     vmi_mode_t mode = {0};
     vmi_init_data_t *init_data = NULL;
     int retcode = 1;
@@ -144,10 +247,17 @@ int main (int argc, char **argv)
         goto error_exit;
     }
 
+    vm_id = vmi_get_vmid(vmi);
+    if (vm_id == VMI_INVALID_DOMID) {
+        printf("Unable to fetch vm id.\n");
+         goto error_exit;
+    }
+
+
     vmi_event_t cr3_event = {0};
     cr3_event.version = VMI_EVENTS_VERSION;
     cr3_event.type = VMI_EVENT_REGISTER;
-    cr3_event.callback = cr3_callback;
+    cr3_event.callback = cr3_callback_with_switching;
     cr3_event.reg_event.reg = CR3;
     cr3_event.reg_event.in_access = VMI_REGACCESS_W;
 
@@ -159,99 +269,48 @@ int main (int argc, char **argv)
         goto error_exit;
     }
     printf("Got targetCr3: 0x%x\n", (uint)targetCr3);
-
-    uint32_t vmi_id = vmi_get_vmid(vmi); // TODO: invalid value check
-    // grab current value of ALTP2M.
-    uint64_t current_altp2m;
-    if (xc_hvm_param_get(xc, vmi_id, HVM_PARAM_ALTP2M, &current_altp2m) < 0)
-    {
-        printf("Failed to get HVM_PARAM_ALTP2M.\n");
-        goto error_exit;
-    } else {
-        printf("current_altp2m = %lu\n", current_altp2m);
-    }
-    // is ALTP2M not at external mode? turn it on.
-    if (current_altp2m != XEN_ALTP2M_external &&
-        xc_hvm_param_set(xc, vmi_id, HVM_PARAM_ALTP2M, XEN_ALTP2M_external) < 0)
-    {
-        printf("Failed to set HVM_PARAM_ALTP2M.\n");
+    
+    if (altp2m_setup(xc, vmi)) {
         goto error_exit;
     }
-
-    //get domain state
-    bool isEnabled = false;
-    if( VMI_FAILURE == vmi_slat_get_domain_state(vmi, &isEnabled))
-    {
-        printf("Could not get domain state");
-        goto error_exit;
-    }
-    printf("Current domain state is %d\n", isEnabled);
-
-
-    //create second slat for fast switch
-    if( VMI_FAILURE == vmi_slat_set_domain_state(vmi, true))
-    {
-        printf("Could not enable slat. Aborting");
-        goto error_exit;
-    }
-
-    uint16_t* view_rw; 
-    if( VMI_FAILURE == vmi_slat_create(vmi, &view_rw))
-    {
-        printf("Could not create view_rw. Aborting");
-        goto error_exit;
-    }
-    printf("view_rw is %d\n", view_rw);
-
-    uint16_t* view_x; 
-    if( VMI_FAILURE == vmi_slat_create(vmi, &view_x))
-    {
-        printf("Could not create view_x. Aborting");
-        goto error_exit;
-    }
-    printf("view_x is %d\n", view_x);
-
-    // register event
-    if (vmi_register_event(vmi, &cr3_event) == VMI_FAILURE)
-        goto error_exit;
 
     if (vmi_resume_vm(vmi) ==  VMI_FAILURE)
         goto error_exit;
 
+    if( measure_cr3_switches(vmi, &cr3_event) <0)
+    {
+        printf("Could not measure cr3 switches");
+        goto error_exit;
+    }
+    
     bool use_fast_switch = true;
     if(use_fast_switch)
     {
-        if (set_fast_switch(xc, vmi, vmi_id, targetCr3, view_rw, view_x) == VMI_FAILURE)
+        if (setup_fast_switch(xc, vmi, targetCr3))
         {
-            printf("Could not set fast switch\n");
+            printf("Could not setup fast switch\n");
             goto error_exit;
         }
+        printf("########### fast switch successfully enabled ########### \n");
     }
 
-    int target_seconds = 30;
-    time_t start_time,end_time;
-
-    for(int i = 0; i<5; i++)
+    cr3_event.callback = cr3_callback_only_counting;
+    if( measure_cr3_switches(vmi, &cr3_event) <0)
     {
-        systemCr3Events = 0;
-        unwantedC3Events = 0;
-        time (&start_time);
-        time (&end_time);
-        printf("Waiting for events in iteration %d. Starttime: %ju Seconds: %ju\n", i, start_time, target_seconds);
-        while (!interrupted && (difftime(end_time, start_time) < target_seconds)) 
-        {
-            time (&end_time);
-            status = vmi_events_listen(vmi, 500);
-            if (status == VMI_FAILURE)
-                printf("Failed to listen on events\n");
-        }
-        printf ("Got %d cr3 events for %x in %d sec. %d other events.\n",systemCr3Events, (uint)targetCr3, target_seconds, unwantedC3Events );
+        printf("Could not measure cr3 switches");
+        goto error_exit;
     }
+
     retcode = 0;
 error_exit:
     vmi_clear_event(vmi, &cr3_event, NULL);
-    vmi_slat_destroy(vmi, &view_rw);
-    vmi_slat_destroy(vmi, &view_x);
+    for (uint i = 0; i < vmi_get_num_vcpus(vmi); i++)
+    {
+        xc_altp2m_remove_fast_switch(xc, vm_id, i, targetCr3);
+    }
+
+    vmi_slat_destroy(vmi, view_rw);
+    vmi_slat_destroy(vmi, view_x);
     
     // close xen access handle if open.
     if(xc != NULL)
